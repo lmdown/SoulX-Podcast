@@ -1,5 +1,6 @@
 import time
 from datetime import datetime
+from contextlib import nullcontext
 
 from tqdm import tqdm
 from itertools import chain
@@ -22,7 +23,24 @@ class SoulXPodcast(torch.nn.Module):
         super().__init__()
         self.config = Config() if config is None else config
 
-        self.audio_tokenizer = s3tokenizer.load_model("speech_tokenizer_v2_25hz").cuda().eval()
+        # auto-select device: prefer CUDA, then MPS (Apple), else CPU
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+
+        # audio tokenizer: try moving to device if supported; keep backwards-compatibility
+        self.audio_tokenizer = s3tokenizer.load_model("speech_tokenizer_v2_25hz")
+        try:
+            # some tokenizers support .to(device)
+            self.audio_tokenizer = self.audio_tokenizer.to(self.device)
+        except Exception:
+            # ignore if not supported
+            pass
+        self.audio_tokenizer = self.audio_tokenizer.eval()
+
         if self.config.llm_engine == "hf":
             self.llm = HFLLMEngine(**self.config.__dict__)
         elif self.config.llm_engine == "vllm":
@@ -30,20 +48,23 @@ class SoulXPodcast(torch.nn.Module):
         else:
             raise NotImplementedError
 
+        # whether to show progress bars; can be toggled externally
         self.use_tqdm = True
 
         self.flow = CausalMaskedDiffWithXvec()
         if self.config.hf_config.fp16_flow:
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
             tqdm.write(f"[{timestamp}] - [INFO] - Casting flow to fp16")
-            self.flow.half()
+            # only change dtype here; device move happens after loading weights
+            self.flow = self.flow.half()
+        # load to CPU first to be robust, then move to chosen device
         self.flow.load_state_dict(torch.load(f"{self.config.model}/flow.pt", map_location="cpu", weights_only=True), strict=True)
-        self.flow.cuda().eval()
+        self.flow = self.flow.to(self.device).eval()
 
         self.hift = HiFTGenerator()
         hift_state_dict = {k.replace('generator.', ''): v for k, v in torch.load(f"{self.config.model}/hift.pt", map_location="cpu", weights_only=True).items()}
         self.hift.load_state_dict(hift_state_dict, strict=True)
-        self.hift.cuda().eval()
+        self.hift = self.hift.to(self.device).eval()
 
     
     @torch.inference_mode()
@@ -65,9 +86,17 @@ class SoulXPodcast(torch.nn.Module):
         prompt_size, turn_size = len(prompt_mels_for_llm), len(text_tokens_for_llm)
 
         # Audio tokenization
-        prompt_speech_tokens_ori, prompt_speech_tokens_lens_ori = self.audio_tokenizer.quantize(
-            prompt_mels_for_llm.cuda(), prompt_mels_lens_for_llm.cuda()
-        )
+        # ensure tensors are on the right device before passing to tokenizer.quantize
+        device = self.device
+        try:
+            prompt_speech_tokens_ori, prompt_speech_tokens_lens_ori = self.audio_tokenizer.quantize(
+                prompt_mels_for_llm.to(device), prompt_mels_lens_for_llm.to(device)
+            )
+        except Exception:
+            # fallback: some tokenizers expect CPU tensors or handle device internally
+            prompt_speech_tokens_ori, prompt_speech_tokens_lens_ori = self.audio_tokenizer.quantize(
+                prompt_mels_for_llm, prompt_mels_lens_for_llm
+            )
 
         # align speech token with speech feat as to reduce
         #    the noise ratio during the generation process.
@@ -81,10 +110,10 @@ class SoulXPodcast(torch.nn.Module):
             prompt_mel_len = prompt_mel.shape[0]
             if prompt_speech_token_len * 2 > prompt_mel_len:
                 prompt_speech_token = prompt_speech_token[:int(prompt_mel_len/2)]
-                prompt_mel_len = torch.tensor([prompt_mel_len]).cuda()
+                prompt_mel_len = torch.tensor([prompt_mel_len], device=device)
             else:
-                prompt_mel = prompt_mel.detach().clone()[:prompt_speech_token_len * 2].cuda()
-                prompt_mel_len = torch.tensor([prompt_speech_token_len * 2]).cuda()
+                prompt_mel = prompt_mel.detach().clone()[:prompt_speech_token_len * 2].to(device)
+                prompt_mel_len = torch.tensor([prompt_speech_token_len * 2], device=device)
             prompt_speech_tokens.append(prompt_speech_token)
             prompt_mels_for_flow.append(prompt_mel)
             prompt_mels_lens_for_flow.append(prompt_mel_len)
@@ -114,7 +143,22 @@ class SoulXPodcast(torch.nn.Module):
         cache_config = AutoPretrainedConfig().from_dataclass(self.llm.config.hf_config)
         past_key_values = DynamicCache(config=cache_config)
         valid_turn_size = prompt_size
-        for i in range(turn_size):
+
+        # choose amp/autocast context: enable only for CUDA (safe and minimal change)
+        if device.type == "cuda":
+            amp_ctx = torch.cuda.amp.autocast
+            amp_kwargs = {"dtype": torch.float16 if self.config.hf_config.fp16_flow else torch.float32}
+        else:
+            amp_ctx = nullcontext
+            amp_kwargs = {}
+
+        # build iterator with optional progress bar to preserve original loop semantics
+        if self.use_tqdm:
+            loop_iter = tqdm(range(turn_size), desc="Generating turns", unit="turn", leave=True)
+        else:
+            loop_iter = range(turn_size)
+
+        for i in loop_iter:
 
             # # set ratio: reach the reset cache ratio;
             if valid_turn_size > self.config.max_turn_size or len(inputs)>self.config.turn_tokens_threshold:
@@ -141,27 +185,33 @@ class SoulXPodcast(torch.nn.Module):
             turn_spk = spk_ids[i]
             generated_speech_tokens = [token - self.config.hf_config.speech_token_offset for token in  llm_outputs['token_ids'][:-1]]  # ignore last eos
             prompt_speech_token = prompt_speech_tokens[turn_spk].tolist()
-            flow_input = torch.tensor([prompt_speech_token + generated_speech_tokens])
-            flow_inputs_len = torch.tensor([len(prompt_speech_token) + len(generated_speech_tokens)])
+            flow_input = torch.tensor([prompt_speech_token + generated_speech_tokens], device=device)
+            flow_inputs_len = torch.tensor([len(prompt_speech_token) + len(generated_speech_tokens)], device=device)
 
             # Flow generation and HiFi-GAN generation            
             start_idx = spk_ids[i]
-            prompt_mels = prompt_mels_for_flow[start_idx][None]
-            prompt_mels_lens = prompt_mels_lens_for_flow[start_idx][None]
-            spk_emb = spk_emb_for_flow[start_idx:start_idx+1]
+            prompt_mels = prompt_mels_for_flow[start_idx][None].to(device)
+            prompt_mels_lens = prompt_mels_lens_for_flow[start_idx][None].to(device)
+            spk_emb = spk_emb_for_flow[start_idx:start_idx+1].to(device)
 
             # Flow generation
-            with torch.amp.autocast("cuda", dtype=torch.float16 if self.config.hf_config.fp16_flow else torch.float32):
+            with amp_ctx(**amp_kwargs):
                 generated_mels, generated_mels_lens = self.flow(
-                    flow_input.cuda(), flow_inputs_len.cuda(),
-                    prompt_mels, prompt_mels_lens, spk_emb.cuda(),
+                    flow_input.to(device), flow_inputs_len.to(device),
+                    prompt_mels, prompt_mels_lens, spk_emb,
                     streaming=False, finalize=True
                 )
 
             # HiFi-GAN generation
             mel = generated_mels[:, :, prompt_mels_lens[0].item():generated_mels_lens[0].item()]
             wav, _ = self.hift(speech_feat=mel)
-            generated_wavs.append(wav)
+            generated_wavs.append(wav.detach().cpu())
+
+            # optionally update description with intermediate info (keeps backward-compatible)
+            if self.use_tqdm and isinstance(loop_iter, tqdm):
+                # show simple timing info in postfix
+                elapsed = time.time() - start_time
+                loop_iter.set_postfix({'last_turn_s': f"{elapsed:.2f}"})
 
         # Save the generated wav;
         results_dict['generated_wavs'] = generated_wavs
